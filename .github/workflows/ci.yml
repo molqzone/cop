@@ -1,0 +1,23 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Run the page tests
+        run: python3 -m unittest discover -s tests -v
+      - name: The tool must run without importing anything outside the stdlib
+        run: python3 -c "import ast,sys;tree=ast.parse(open('cop').read());mods={n.names[0].name.split('.')[0] for n in ast.walk(tree) if isinstance(n,ast.Import)}|{n.module.split('.')[0] for n in ast.walk(tree) if isinstance(n,ast.ImportFrom) and n.module};print(sorted(mods));sys.exit(0 if mods <= {'argparse','fcntl','glob','json','mmap','os','struct','sys','time'} else 1)"
+      - name: The CLI answers
+        run: ./cop --help > /dev/null

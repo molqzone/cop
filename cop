@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+"""cop - the userspace half of a coprocessor shared page.
+
+Linux-side CLI for a coprocessor shared page: uio discovery, self-describing
+header, named channels, mailbox doorbell.  It defines no format -- the core that
+writes the page does.
+
+`cop` owns the part of the co-processor link that is *transport*, not product:
+
+    cop list                          discover the pages from the device tree
+    cop status [--contract FILE]      decode the self-describing page header
+    cop dump [--offset N] [--bytes N] hex dump (forensics)
+    cop log [--contract FILE] [--new] stream the console ring
+    cop watch [--contract FILE]       print new telemetry slots (opaque bytes)
+    cop send --contract FILE --type N --payload HEX   send one typed command
+
+Discovery comes from the device tree: the DT node exposes the pages as a
+generic-uio device, `/sys/class/uio/.../maps/mapN/name` carries the `reg-names`
+(`console`, `shared`), and the addresses come from `maps/mapN/addr`.  So `cop`
+never hardcodes a map index.
+
+The page header is **self-describing** (magic / abi / page size / slot count /
+slot size / payload size / region offset / wire tag), so `status`, `dump` and
+`watch` need no contract at all.  A contract JSON (`--contract`) adds only what
+the header cannot carry: the frame layout, checksum, channel names and the
+command values.  `cop` does not know what a command *means* - `send --type N`
+is the transport-level escape hatch; the product's own tool names the types.
+
+Everything here is a mechanism (map, read, write, ring); no product semantics and no
+product names.
+
+There is deliberately no `format` verb: the core that writes the page builds it at
+bring-up, and a page nobody built is a fact to report, not something to overwrite from
+the other side.  `status` prints UNFORMATTED / FOREIGN and the caller decides what that
+means for it.
+"""
+
+import argparse
+import fcntl
+import glob
+import json
+import mmap
+import os
+import struct
+import sys
+import time
+
+# --- transport constants (shared-page-xr), not product data -----------------
+
+# Page header magic and layout of the self-describing header.
+PAGE_MAGIC = 0x31506461
+HEADER = struct.Struct("<8I")
+HEADER_BYTES = HEADER.size
+CACHE_LINE = 64
+
+# Channel table: one announced generation plus fixed-size entries.
+CHANNEL_TABLE_MAGIC = 0x3130534E
+CHANNEL_ENTRY_BYTES = 42
+CHANNEL_NAME_BYTES = 28
+CHANNEL_ENTRY = struct.Struct("<IIIH%ds" % CHANNEL_NAME_BYTES)
+
+# The command doorbell (vendor cmdqu UAPI): one blocking SEND_WAIT per command.
+CMDQU_DEV = "/dev/cvi-rtos-cmdqu"
+RTOS_CMDQU_SEND_WAIT = 0x40087204
+CMDQU = struct.Struct("<BBHI")
+IP_SYSTEM = 6
+DOORBELL_CMD = 0x7F
+DOORBELL_BLOCK = 1
+REPLY_TIMEOUT_MS = 3000
+
+DEFAULT_UIO_NAME = "guidance-pages"
+DEFAULT_PAGE_SIZE = 4096
+
+
+def fail(message):
+    sys.stderr.write("cop: %s\n" % message)
+    raise SystemExit(1)
+
+
+def align_up(value, alignment):
+    return (value + alignment - 1) & ~(alignment - 1)
+
+
+# --- discovery: the device tree, through sysfs ------------------------------
+
+
+def find_uio(name):
+    for entry in sorted(glob.glob("/sys/class/uio/uio*")):
+        try:
+            with open(os.path.join(entry, "name")) as handle:
+                if handle.read().strip() == name:
+                    return entry
+        except OSError:
+            continue
+    return None
+
+
+def uio_maps(entry):
+    """The node's maps in index order, with the DT reg-names as their names."""
+    maps = []
+    for path in sorted(
+        glob.glob(os.path.join(entry, "maps", "map*")),
+        key=lambda item: int(item.rsplit("map", 1)[1]),
+    ):
+        def read(field):
+            try:
+                with open(os.path.join(path, field)) as handle:
+                    return handle.read().strip()
+            except OSError:
+                return ""
+
+        maps.append(
+            {
+                "index": int(path.rsplit("map", 1)[1]),
+                "name": read("name"),
+                "addr": int(read("addr"), 0) if read("addr") else 0,
+                "size": int(read("size"), 0) if read("size") else 0,
+            }
+        )
+    return maps
+
+
+# --- mapping ----------------------------------------------------------------
+
+
+class Page:
+    """One mapped page: a uio map, or a plain file for host testing."""
+
+    def __init__(self, path, map_index, size):
+        self.fd = os.open(path, os.O_RDWR)
+        self.size = size
+        self.mm = mmap.mmap(self.fd, size, offset=map_index * mmap.PAGESIZE)
+        self.origin = "%s map %d" % (path, map_index)
+
+    def read(self, offset, size):
+        self.mm.seek(offset)
+        return self.mm.read(size)
+
+    def write(self, offset, data):
+        self.mm.seek(offset)
+        self.mm.write(data)
+
+    def u32(self, offset):
+        return struct.unpack("<I", self.read(offset, 4))[0]
+
+
+def open_file_page(path, size):
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    os.ftruncate(fd, size)
+    os.close(fd)
+    page = Page.__new__(Page)
+    page.fd = os.open(path, os.O_RDWR)
+    page.size = size
+    page.mm = mmap.mmap(page.fd, size)
+    page.origin = path
+    return page
+
+
+def open_page(args, role, size_hint):
+    if args.page:
+        return open_file_page(args.page, size_hint or DEFAULT_PAGE_SIZE)
+    node = find_uio(args.uio_name)
+    if node is None:
+        fail("%s uio device not found (is uio_pdrv_genirq loaded?)" % args.uio_name)
+    maps = uio_maps(node)
+    chosen = next((item for item in maps if item["name"] == role), None)
+    if chosen is None:
+        # No reg-names: fall back to the documented order (console = 0, shared = 1).
+        chosen = next((item for item in maps if item["index"] == (0 if role == "console" else 1)),
+                      None)
+    if chosen is None:
+        fail("%s has no %r map (maps: %s)" % (node, role, maps))
+    return Page("/dev/" + os.path.basename(node), chosen["index"], chosen["size"])
+
+
+# --- contract (optional) ----------------------------------------------------
+
+
+def load_contract(path):
+    try:
+        with open(path) as handle:
+            document = json.load(handle)
+    except OSError as error:
+        fail("cannot read contract %s (%s)" % (path, error))
+    except ValueError as error:
+        fail("contract %s is not valid JSON: %s" % (path, error))
+    if document.get("schema") != 1:
+        fail("unsupported contract schema %r" % document.get("schema"))
+    return document
+
+
+# --- page geometry from the self-describing header --------------------------
+
+
+def parse_header(page):
+    fields = HEADER.unpack(page.read(0, HEADER_BYTES))
+    return dict(zip(
+        ("magic", "abi", "page_size", "slot_count", "slot_bytes", "payload_bytes",
+         "region_offset", "tag"), fields))
+
+
+def geometry(header):
+    telemetry = align_up(HEADER_BYTES, CACHE_LINE)
+    ring_end = telemetry + header["slot_count"] * header["slot_bytes"]
+    return {
+        "telemetry": telemetry,
+        "head": ring_end,
+        "write_state": ring_end + 4,
+        "channels": align_up(ring_end + 8, CACHE_LINE),
+    }
+
+
+def state_name(header):
+    if header["magic"] == 0:
+        return "UNFORMATTED"
+    if header["magic"] != PAGE_MAGIC:
+        return "FOREIGN"
+    return "FORMATTED"
+
+
+def channels(page, header):
+    offset = geometry(header)["channels"]
+    magic, count, gen, _ = struct.unpack("<4I", page.read(offset, 16))
+    if magic != CHANNEL_TABLE_MAGIC:
+        return offset, 0, 0, []
+    entries = []
+    for index in range(min(count, 8)):
+        key, endpoint, flags, name_len, name = CHANNEL_ENTRY.unpack(
+            page.read(offset + 16 + index * CHANNEL_ENTRY_BYTES, CHANNEL_ENTRY_BYTES))
+        entries.append((name[:name_len].decode("utf-8", "replace"), endpoint, key, flags))
+    return offset, count, gen, entries
+
+
+# --- subcommands ------------------------------------------------------------
+
+
+def cmd_list(args):
+    node = find_uio(args.uio_name)
+    if node is None:
+        fail("%s uio device not found" % args.uio_name)
+    print("%s (%s)" % (args.uio_name, node))
+    for item in uio_maps(node):
+        print("  map %d  %-8s addr=0x%08x size=%d" %
+              (item["index"], item["name"] or "-", item["addr"], item["size"]))
+
+
+def cmd_status(args):
+    page = open_page(args, "shared", DEFAULT_PAGE_SIZE)
+    header = parse_header(page)
+    geom = geometry(header)
+    print("mapping   : %s" % page.origin)
+    print("page      : %s magic=0x%08x" % (state_name(header), header["magic"]))
+    if state_name(header) == "FORMATTED":
+        print("geometry  : abi=%u size=%u slots=%u slot=%u payload=%u region=%u tag=%u"
+              % (header["abi"], header["page_size"], header["slot_count"],
+                 header["slot_bytes"], header["payload_bytes"],
+                 header["region_offset"], header["tag"]))
+        print("layout    : ring=%d head=%d write_state=%d channels=%d"
+              % (geom["telemetry"], geom["head"], geom["write_state"], geom["channels"]))
+        offset, count, gen, entries = channels(page, header)
+        print("channels  : %d announced (gen %d) at %d" % (count, gen, offset))
+        for name, endpoint, key, flags in entries:
+            print("            %-12s endpoint=0x%x flags=%u key=0x%08x"
+                  % (name, endpoint, flags, key))
+        print("head      : %u (write_state %u)"
+              % (page.u32(geom["head"]), page.u32(geom["write_state"])))
+        addr = header["region_offset"]
+        print("region    : seq=%u (offset %d)"
+              % (page.u32(addr + header["payload_bytes"] + 4), addr))
+
+    contract = load_contract(args.contract) if args.contract else None
+    if contract is None:
+        return 0
+    page_c = contract["page"]
+    expect = (page_c["abi_version"], page_c["bytes"], contract["telemetry"]["slot_count"],
+              contract["telemetry"]["slot_bytes"], contract["region"]["payload_bytes"],
+              contract["region"]["offset"], page_c["wire_tag"])
+    actual = (header["abi"], header["page_size"], header["slot_count"],
+              header["slot_bytes"], header["payload_bytes"], header["region_offset"],
+              header["tag"])
+    print("contract  : %s" % args.contract)
+    if actual != expect:
+        sys.stderr.write("cop: contract mismatch: page has %s, contract expects %s\n"
+                         % (actual, expect))
+        return 1
+    return 0
+
+
+def cmd_dump(args):
+    page = open_page(args, "shared", DEFAULT_PAGE_SIZE)
+    base = args.offset
+    data = page.read(base, min(args.bytes, page.size - base))
+    for line in range(0, len(data), 16):
+        chunk = data[line:line + 16]
+        print("%04x  %-47s  %s" % (
+            base + line,
+            " ".join("%02x" % byte for byte in chunk),
+            "".join(chr(byte) if 32 <= byte < 127 else "." for byte in chunk)))
+
+
+def cmd_log(args):
+    contract = load_contract(args.contract) if args.contract else None
+    index_offset, ring_offset, ring_bytes = console_layout(contract)
+    page = open_page(args, "console", ring_offset + ring_bytes)
+    total = page.u32(index_offset)
+    seen = 0 if (args.new or total < ring_bytes) else total - ring_bytes
+    try:
+        while True:
+            total = page.u32(index_offset)
+            if total < seen:
+                seen = 0 if total < ring_bytes else total - ring_bytes
+            if total - seen > ring_bytes:
+                sys.stderr.write("[cop] console ring overrun, %d bytes lost\n"
+                                 % (total - seen - ring_bytes))
+                seen = total - ring_bytes
+            while seen < total:
+                start = seen % ring_bytes
+                chunk = min(total - seen, ring_bytes - start, 256)
+                sys.stdout.buffer.write(page.read(ring_offset + start, chunk))
+                sys.stdout.flush()
+                seen += chunk
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        return 0
+
+
+def cmd_watch(args):
+    page = open_page(args, "shared", DEFAULT_PAGE_SIZE)
+    header = parse_header(page)
+    if state_name(header) != "FORMATTED":
+        fail("page is %s: the core that builds it is not running, or pins a firmware "
+             "that does not build it" % state_name(header))
+    geom = geometry(header)
+    slot = header["slot_bytes"]
+    seen = page.u32(geom["head"])
+    slots = header["slot_count"]
+    print("watching slots of %d bytes (head %d, %d slots)" % (slot, seen, slots))
+    try:
+        while True:
+            head = page.u32(geom["head"])
+            if head < seen:
+                seen = head
+            if head - seen > slots:
+                sys.stderr.write("[cop] %d sample(s) dropped\n" % (head - seen - slots))
+                seen = head - slots
+            while seen < head:
+                offset = geom["telemetry"] + (seen % slots) * slot
+                print("%u  %s" % (seen, page.read(offset, slot).hex()))
+                seen += 1
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        return 0
+
+
+def cmd_send(args):
+    if not args.contract:
+        fail("send needs --contract (command magic and region geometry)")
+    contract = load_contract(args.contract)
+    region = contract["region"]
+    command = contract["command"]
+    payload_bytes = region["payload_bytes"]
+    body = bytes.fromhex(args.payload)
+    if len(body) > payload_bytes - 8:
+        fail("payload is %d bytes, the contract leaves %d" % (len(body), payload_bytes - 8))
+    page = open_page(args, "shared", contract["page"]["bytes"])
+    if state_name(parse_header(page)) != "FORMATTED":
+        fail("page is %s; a command needs a page its owner has built"
+             % state_name(parse_header(page)))
+    seq = (page.u32(region["seq_offset"]) + 1) & 0xFFFF
+    slot = struct.pack("<IHH%ds" % (payload_bytes - 8), command["magic"], args.type,
+                       seq, body)
+    page.write(region["offset"], slot)
+    page.write(region["seq_offset"], struct.pack("<I", seq))
+    if not os.path.exists(CMDQU_DEV):
+        fail("%s is missing (is the cmdqu kernel module loaded?)" % CMDQU_DEV)
+    fd = os.open(CMDQU_DEV, os.O_RDWR)
+    try:
+        reply = bytearray(CMDQU.pack(IP_SYSTEM, DOORBELL_CMD | (DOORBELL_BLOCK << 7),
+                                     REPLY_TIMEOUT_MS, seq))
+        fcntl.ioctl(fd, RTOS_CMDQU_SEND_WAIT, reply, True)
+        param = struct.unpack("<BBHI", bytes(reply))[3]
+    finally:
+        os.close(fd)
+    print("sent type=%u seq=%u, reply=0x%08x" % (args.type, seq, param))
+    return 0 if param == seq else 1
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(prog="cop", description=__doc__.splitlines()[0])
+    parser.add_argument("--uio-name", default=DEFAULT_UIO_NAME,
+                        help="DT linux,uio-name of the pages (default %(default)s)")
+    parser.add_argument("--page", help="map the main page from a file (host testing)")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("list", help="discover the pages from the device tree")
+    status = sub.add_parser("status", help="decode the self-describing page header")
+    status.add_argument("--contract")
+    dump = sub.add_parser("dump", help="hex dump (forensics)")
+    dump.add_argument("--offset", type=lambda value: int(value, 0), default=0)
+    dump.add_argument("--bytes", type=lambda value: int(value, 0), default=256)
+    log = sub.add_parser("log", help="stream the console ring")
+    log.add_argument("--contract")
+    log.add_argument("--new", action="store_true")
+    watch = sub.add_parser("watch", help="print new telemetry slots as opaque bytes")
+    watch.add_argument("--contract")
+    send = sub.add_parser("send", help="send one typed command")
+    send.add_argument("--contract", required=True)
+    send.add_argument("--type", type=lambda value: int(value, 0), required=True)
+    send.add_argument("--payload", default="")
+
+    args = parser.parse_args(argv)
+    handlers = {"list": cmd_list, "status": cmd_status, "dump": cmd_dump,
+                "log": cmd_log, "watch": cmd_watch,
+                "send": cmd_send}
+    return handlers[args.command](args) or 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except BrokenPipeError:
+        sys.exit(0)
