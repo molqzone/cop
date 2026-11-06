@@ -127,7 +127,15 @@ class Page:
     """One mapped page: a uio map, or a plain file for host testing."""
 
     def __init__(self, path, map_index, size):
-        self.fd = os.open(path, os.O_RDWR)
+        try:
+            self.fd = os.open(path, os.O_RDWR)
+        except PermissionError:
+            fail(
+                "cannot open %s: permission denied.  uio devices are root-only unless a "
+                "udev rule says otherwise -- run this as root, or install a rule such as "
+                'SUBSYSTEM=="uio", KERNEL=="uio*", MODE="0660", GROUP="plugdev"'
+                % path
+            )
         self.size = size
         self.mm = mmap.mmap(self.fd, size, offset=map_index * mmap.PAGESIZE)
         self.origin = "%s map %d" % (path, map_index)
