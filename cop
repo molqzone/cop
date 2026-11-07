@@ -306,6 +306,26 @@ def cmd_dump(args):
             "".join(chr(byte) if 32 <= byte < 127 else "." for byte in chunk)))
 
 
+def console_layout(contract):
+    """Return (index_offset, ring_offset, ring_bytes) of the console ring.
+
+    The console page has a layout of its own -- a byte counter in the first cache line
+    and the ring in the rest of the page -- and a contract describes it, because the
+    firmware emits the contract and owns the page.  Without a contract the firmware's
+    defaults apply; they are stated here once rather than at each use.
+    """
+    if contract is None:
+        return 0, CACHE_LINE, DEFAULT_PAGE_SIZE - CACHE_LINE
+    console = contract.get("console")
+    if not isinstance(console, dict):
+        fail("the contract has no console section")
+    try:
+        return (int(console["index_offset"]), int(console["ring_offset"]),
+                int(console["ring_bytes"]))
+    except KeyError as missing:
+        fail("the contract's console section has no %s" % missing.args[0])
+
+
 def cmd_log(args):
     contract = load_contract(args.contract) if args.contract else None
     index_offset, ring_offset, ring_bytes = console_layout(contract)

@@ -32,6 +32,7 @@ SLOT_BYTES = 64
 PAYLOAD = 24
 REGION = 4064
 TAG = 6
+CACHE_LINE = 64
 TABLE = 3840
 TABLE_MAGIC = 0x3130534E
 ENTRY = 42
@@ -202,6 +203,24 @@ class CliTests(Fixture):
         done = self.run_cop("watch", timeout=5)
         self.assertEqual(done.returncode, 1)
         self.assertIn("UNFORMATTED", done.stderr)
+
+    def test_log_streams_the_console_ring(self) -> None:
+        # `cop log` shipped once with its layout helper missing entirely, so the verb
+        # raised NameError on the board.  The ring is written the way the firmware
+        # writes it: a byte counter in the first cache line, then the bytes.
+        page = bytearray(PAGE)
+        message = b"bring-up: board ok\n"
+        page[CACHE_LINE:CACHE_LINE + len(message)] = message
+        struct.pack_into("<I", page, 0, len(message))
+        self.write(bytes(page))
+        with self.assertRaises(subprocess.TimeoutExpired) as caught:
+            self.run_cop("log", "--new", "--contract", str(self.contract), timeout=5)
+        # The stream is drained from the subprocess pipe when the timeout fires, so the
+        # bytes are already there; `log` writes raw bytes, not text.
+        captured = caught.exception.output
+        if isinstance(captured, bytes):
+            captured = captured.decode()
+        self.assertIn("bring-up: board ok", captured)
 
     def test_there_is_no_format_verb(self) -> None:
         self.write(bytes(PAGE))
