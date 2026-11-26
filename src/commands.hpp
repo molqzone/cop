@@ -9,7 +9,7 @@ namespace cop
 /// @brief 解析后的命令行选项 / Parsed command-line options.
 struct Options
 {
-  std::string uio_name = "guidance-pages";
+  std::string uio_name = "rtos-pages";
   std::string page;  ///< `--page FILE`: host testing instead of a UIO device.
   std::string verb;
   uint32_t offset = 0;
