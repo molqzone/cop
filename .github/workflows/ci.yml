@@ -4,20 +4,52 @@ on:
   push:
   pull_request:
 
+env:
+  LIBXR_REPO: https://github.com/jiu-xiao/libxr
+  LIBXR_COMMIT: 9193bd2efeffbd3260dc0c022f8d47300127f9a3
+  SHARED_PAGE_REPO: https://github.com/molqzone/shared-page-xr
+  # The branch that carries PageView / ConsoleView until the commit is merged.
+  SHARED_PAGE_COMMIT: feat/self-describing-pages
+
 jobs:
-  unittest:
+  host:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python: ["3.9", "3.12"]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python }}
-      - name: Run the page tests
-        run: python3 -m unittest discover -s tests -v
-      - name: The tool must run without importing anything outside the stdlib
-        run: python3 -c "import ast,sys;tree=ast.parse(open('cop').read());mods={n.names[0].name.split('.')[0] for n in ast.walk(tree) if isinstance(n,ast.Import)}|{n.module.split('.')[0] for n in ast.walk(tree) if isinstance(n,ast.ImportFrom) and n.module};print(sorted(mods));sys.exit(0 if mods <= {'argparse','fcntl','glob','json','mmap','os','struct','sys','time'} else 1)"
-      - name: The CLI answers
-        run: ./cop --help > /dev/null
+      - name: Dependencies
+        run: |
+          git clone "$LIBXR_REPO" third_party/libxr
+          git -C third_party/libxr checkout "$LIBXR_COMMIT"
+          git clone "$SHARED_PAGE_REPO" third_party/shared-page-xr
+          git -C third_party/shared-page-xr checkout "$SHARED_PAGE_COMMIT"
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  riscv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          git clone "$LIBXR_REPO" third_party/libxr
+          git -C third_party/libxr checkout "$LIBXR_COMMIT"
+          git clone "$SHARED_PAGE_REPO" third_party/shared-page-xr
+          git -C third_party/shared-page-xr checkout "$SHARED_PAGE_COMMIT"
+      - name: Cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-riscv64-linux-gnu gcc-riscv64-linux-gnu qemu-user-static
+      - name: Configure (static RISC-V)
+        run: |
+          cmake -S . -B build-rv \
+            -DCMAKE_C_COMPILER=riscv64-linux-gnu-gcc \
+            -DCMAKE_CXX_COMPILER=riscv64-linux-gnu-g++ \
+            -DCOP_STATIC=ON -DCOP_BUILD_TESTS=OFF
+      - name: Build
+        run: cmake --build build-rv -j"$(nproc)"
+      - name: The static binary runs under QEMU
+        run: qemu-riscv64-static build-rv/cop --help > /dev/null
