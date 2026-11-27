@@ -8,8 +8,8 @@ env:
   LIBXR_REPO: https://github.com/jiu-xiao/libxr
   LIBXR_COMMIT: 9193bd2efeffbd3260dc0c022f8d47300127f9a3
   SHARED_PAGE_REPO: https://github.com/molqzone/shared-page-xr
-  # The branch that carries PageView / ConsoleView until the commit is merged.
-  SHARED_PAGE_COMMIT: feat/self-describing-pages
+  # Pin the self-describing-page commit carrying console_page.hpp, PageView and ConsoleViewT.
+  SHARED_PAGE_COMMIT: 9a6b328659e292d0e0365a679541dcf05be52753
 
 jobs:
   host:
