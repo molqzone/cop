@@ -384,7 +384,10 @@ int Send(const Options& options)
   }
 
   std::printf("sent type=%u seq=%u, reply=0x%08x\n", options.type, seq, reply);
-  return reply == seq ? 0 : 1;
+  // The wire command header carries a 16-bit sequence; the kernel reply is a
+  // 32-bit word holding that same 16-bit value.  Compare the truncated forms,
+  // otherwise every send after seq 65535 looks like a failure.
+  return static_cast<uint16_t>(reply) == static_cast<uint16_t>(seq) ? 0 : 1;
 }
 
 int WaitConsole(const Options& options)
