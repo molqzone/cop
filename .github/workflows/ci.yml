@@ -13,7 +13,7 @@ env:
 
 jobs:
   host:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Dependencies
@@ -30,7 +30,7 @@ jobs:
         run: ctest --test-dir build --output-on-failure
 
   riscv:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Dependencies
